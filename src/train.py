@@ -8,6 +8,7 @@ import torch
 from download_tw50 import DEFAULT_DATASET, FEATURES
 from evaluator import evaluate
 from model import get_loss, StockMixer
+from predict import prepare_window
 
 
 np.random.seed(123456789)
@@ -114,12 +115,7 @@ def validate(start_index, end_index):
 def get_batch(offset):
     end = offset + lookback_length
     target = end + steps - 1
-    window = ohlcv[:, offset:end].copy()
-    base = np.where(mask_data[:, end - 1], ohlcv[:, end - 1, 3], 1.0)
-    # Scale prices by the last observed close to compare stocks of different prices.
-    window[:, :, :4] /= base[:, None, None]
-    window[:, :, 4] = np.log1p(window[:, :, 4])
-    window[~mask_data[:, offset:end]] = 0.0
+    window, base = prepare_window(ohlcv[:, offset:end], mask_data[:, offset:end])
     valid = mask_data[:, offset:target + 1].all(axis=1)
     returns = np.where(valid, ohlcv[:, target, 3] / base - 1, 0.0)
     return window, valid[:, None], np.ones_like(returns[:, None]), returns[:, None]
@@ -197,6 +193,7 @@ for epoch in range(args.epochs):
             "val_loss": float(val_loss),
             "symbols": symbols,
             "features": FEATURES,
+            "first_test_date": str(dates[test_index]),
         })
         best_valid_loss = val_loss
         epochs_without_improvement = 0

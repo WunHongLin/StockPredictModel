@@ -3,6 +3,7 @@ import argparse
 import json
 from datetime import date, datetime
 from pathlib import Path
+from time import sleep
 from urllib.request import urlopen
 from zoneinfo import ZoneInfo
 
@@ -72,8 +73,39 @@ def align_history(history, tickers):
     return calendar.strftime("%Y-%m-%d").to_numpy(dtype=str), np.stack(arrays)
 
 
-def main():
+def download_history(tickers, start, end):
     import yfinance as yf
+
+    remaining = list(tickers)
+    frames = []
+    for delay in (0, 15, 45):
+        if not remaining:
+            break
+        if delay:
+            print(f"Retrying {len(remaining)} missing tickers in {delay}s.", flush=True)
+            sleep(delay)
+        result = yf.download(
+            remaining, start=start, end=end, interval="1d", group_by="ticker",
+            auto_adjust=True, multi_level_index=True, threads=False, progress=False,
+        )
+        if result is None or result.empty:
+            continue
+        available = result.columns.get_level_values(0)
+        successful = [
+            ticker for ticker in remaining
+            if ticker in available and result[ticker]["Close"].notna().any()
+        ]
+        frames.extend(result[[ticker]] for ticker in successful)
+        remaining = [ticker for ticker in remaining if ticker not in successful]
+    if remaining:
+        raise RuntimeError(
+            f"Yahoo Finance returned no history for {', '.join(remaining)}. "
+            "Retry later or extend the requested date range."
+        )
+    return pd.concat(frames, axis=1)
+
+
+def main():
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start", type=date.fromisoformat, default=date(2018, 1, 1))
@@ -90,10 +122,7 @@ def main():
         fetch_twse("opendata/t187ap03_L"), fetch_twse("exchangeReport/STOCK_DAY_ALL")
     )
     tickers = [f"{symbol}.TW" for symbol in ranked["symbol"]]
-    history = yf.download(
-        tickers + ["^TWII"], start=args.start, end=end, interval="1d",
-        group_by="ticker", auto_adjust=True, multi_level_index=True, threads=4,
-    )
+    history = download_history(tickers + ["^TWII"], args.start, end)
     dates, ohlcv = align_history(history, tickers)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -175,7 +175,7 @@ def print_performance(split, metrics):
     if steps > 1 or target_offset > 1:
         for day, (mae, rmse, samples) in metrics.items():
             print(f"{split} day +{day}: MAE={mae:.4f} TWD, RMSE={rmse:.4f} TWD, pairs={samples}")
-        return
+            return
     print(
         f"{split} performance: mse:{metrics['mse']:.2e}, IC:{metrics['IC']:.2e}, "
         f"RIC:{metrics['RIC']:.2e}, prec@10:{metrics['prec_10']:.2e}, "

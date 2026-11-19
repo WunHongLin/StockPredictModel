@@ -14,6 +14,7 @@ from predict import prepare_window
 np.random.seed(123456789)
 torch.random.manual_seed(12345678)
 device = torch.device("cuda") if torch.cuda.is_available() else 'cpu'
+print(device)
 
 market_num = 20
 learning_rate = 0.001

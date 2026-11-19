@@ -1,4 +1,4 @@
-"""Plot adjusted closes for rolling one-day or fixed-origin 20-day forecasts."""
+"""Plot adjusted closes for rolling one-day or fixed-origin multi-session forecasts."""
 import argparse
 from datetime import date
 from pathlib import Path
@@ -45,8 +45,6 @@ def compare_closes(predictor, symbol, start, end):
 
 
 def compare_month(predictor, symbol, month_start):
-    if predictor.horizon != 20:
-        raise ValueError("--month requires a checkpoint trained with --horizon 20.")
     if symbol not in predictor.symbols:
         raise ValueError(f"Stock {symbol} is not in the checkpoint's stock universe.")
 
@@ -95,7 +93,8 @@ def save_chart(result, output, title):
     xlabel = "Trading sessions after signal date" if monthly else "Target trading date"
     ax.set(title=title, xlabel=xlabel, ylabel="Adjusted closing price (TWD)")
     if monthly:
-        ax.set_xticks([1, 5, 10, 15, 20])
+        last = int(x.iloc[-1])
+        ax.set_xticks(np.linspace(1, last, num=min(6, last), dtype=int))
     else:
         locator = AutoDateLocator(minticks=3, maxticks=8)
         ax.xaxis.set_major_locator(locator)
@@ -111,7 +110,7 @@ def main():
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--symbol", required=True, help="Stock code in the dataset, e.g. 2330.")
-    parser.add_argument("--month", help="Fixed-origin forecast from the start of YYYY-MM, for a 20-day checkpoint.")
+    parser.add_argument("--month", help="Fixed-origin forecast from the start of YYYY-MM using the checkpoint horizon.")
     parser.add_argument("--start", type=date.fromisoformat, help="First target date, inclusive. Defaults to checkpoint test start.")
     parser.add_argument("--end", type=date.fromisoformat, help="Last target date, inclusive. Defaults to the last data date.")
     parser.add_argument("--output", type=Path, default=Path("close_comparison.png"), help="New PNG path; CSV uses the same stem.")
@@ -133,11 +132,11 @@ def main():
                 raise ValueError("--month must use YYYY-MM.")
             result = compare_month(predictor, args.symbol, np.datetime64(month_start))
             signal_date = result["signal_date"].iat[0]
-            title = f"{args.symbol} | 20-session forecast from {signal_date}"
+            title = f"{args.symbol} | {predictor.horizon}-session forecast from {signal_date}"
             print(f"Month anchor: {args.month}-01 | last input session: {signal_date}")
         else:
             if predictor.horizon != 1:
-                raise ValueError("Use --month YYYY-MM for a 20-day checkpoint.")
+                raise ValueError("Use --month YYYY-MM for a multi-session checkpoint.")
             start = args.start or predictor.first_test_date
             if start is None:
                 raise ValueError("Older checkpoint: set --start to 'test starts' from the training log for test-only comparison.")

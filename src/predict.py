@@ -26,6 +26,7 @@ class StockPredictor:
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         config = checkpoint["model_config"]
         self.lookback = config["time_steps"]
+        self.horizon = config.get("horizon", 1)
         self.first_test_date = checkpoint.get("first_test_date")
 
         with np.load(dataset_path, allow_pickle=False) as dataset:
@@ -63,8 +64,8 @@ class StockPredictor:
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.model.eval()
 
-    def predict(self, as_of_index):
-        """Return forecasts using data through the completed as-of session."""
+    def predict_path(self, as_of_index):
+        """Return base closes and all forecast price ratios from one input window."""
         start = as_of_index - self.lookback + 1
         if start < 0 or as_of_index >= len(self.dates):
             raise ValueError(f"Prediction needs {self.lookback} completed trading sessions.")
@@ -73,9 +74,18 @@ class StockPredictor:
         valid_rows = self.valid_rows[:, start:end]
         window, base_close = prepare_window(self.ohlcv[:, start:end], valid_rows)
         with torch.inference_mode():
-            close_ratio = self.model(torch.from_numpy(window)).reshape(-1).numpy()
+            close_ratio = self.model(torch.from_numpy(window)).numpy()
+        valid = valid_rows.all(axis=1, keepdims=True) & np.isfinite(close_ratio)
+        return base_close, np.where(valid & (close_ratio > 0), close_ratio, np.nan)
 
-        valid = valid_rows.all(axis=1) & np.isfinite(close_ratio) & (close_ratio > 0)
+    def predict(self, as_of_index):
+        """Return next-session forecasts for a one-day checkpoint."""
+        if self.horizon != 1:
+            raise ValueError("For a 20-session checkpoint use compare_close.py --month YYYY-MM.")
+        base_close, ratios = self.predict_path(as_of_index)
+        close_ratio = ratios[:, 0]
+
+        valid = np.isfinite(close_ratio)
         result = pd.DataFrame({
             "symbol": self.symbols,
             "last_adjusted_close": base_close,

@@ -1,4 +1,4 @@
-"""Predict next-session adjusted closing prices from a StockMixer checkpoint."""
+"""Predict adjusted closing prices for the horizon stored in a StockMixer checkpoint."""
 import argparse
 from datetime import date
 from pathlib import Path
@@ -81,7 +81,7 @@ class StockPredictor:
     def predict(self, as_of_index):
         """Return next-session forecasts for a one-day checkpoint."""
         if self.horizon != 1:
-            raise ValueError("For a 20-session checkpoint use compare_close.py --month YYYY-MM.")
+            raise ValueError("This operation requires a one-session checkpoint. Use predict.py for multi-session forecasts.")
         base_close, ratios = self.predict_path(as_of_index)
         close_ratio = ratios[:, 0]
 
@@ -95,6 +95,33 @@ class StockPredictor:
         return result.loc[valid].sort_values(
             ["predicted_return", "symbol"], ascending=[False, True], ignore_index=True
         )
+
+
+def forecast_table(predictor, as_of_index):
+    dates = predictor.dates
+    if predictor.horizon == 1:
+        forecasts = predictor.predict(as_of_index)
+        target = as_of_index + 1
+        forecasts.insert(0, "target_date", str(dates[target]) if target < len(dates) else "")
+    else:
+        base, ratios = predictor.predict_path(as_of_index)
+        stocks, horizons = np.where(np.isfinite(ratios))
+        known = dates[as_of_index + 1:as_of_index + 1 + predictor.horizon]
+        target_dates = np.full(predictor.horizon, "", dtype="U10")
+        target_dates[:len(known)] = known.astype(str)
+        forecasts = pd.DataFrame({
+            "target_date": target_dates[horizons],
+            "horizon": horizons + 1,
+            "symbol": np.asarray(predictor.symbols)[stocks],
+            "last_adjusted_close": base[stocks],
+            "predicted_adjusted_close": base[stocks] * ratios[stocks, horizons],
+            "predicted_return": ratios[stocks, horizons] - 1,
+        }).sort_values(
+            ["horizon", "predicted_return", "symbol"],
+            ascending=[True, False, True], ignore_index=True,
+        )
+    forecasts.insert(0, "as_of", str(dates[as_of_index]))
+    return forecasts
 
 
 def main():
@@ -111,17 +138,17 @@ def main():
         index = int(predictor.dates.searchsorted(as_of))
         if index == len(predictor.dates) or predictor.dates[index] != as_of:
             raise ValueError("--as-of must be a trading date present in the dataset.")
-        forecasts = predictor.predict(index)
+        forecasts = forecast_table(predictor, index)
         if forecasts.empty:
             raise ValueError("No valid stock forecasts on the requested date.")
 
-        # A future session date is only known here when it already exists in the dataset.
-        target = str(predictor.dates[index + 1]) if index + 1 < len(predictor.dates) else ""
-        forecasts.insert(0, "target_date", target)
-        forecasts.insert(0, "as_of", str(as_of))
         if args.output:
             forecasts.to_csv(args.output, index=False, mode="x")
-        print(f"Signal date: {as_of}; target: {target or 'next trading session'}")
+        if predictor.horizon == 1:
+            target = forecasts["target_date"].iat[0] or "next trading session"
+            print(f"Signal date: {as_of}; target: {target}")
+        else:
+            print(f"Signal date: {as_of}; horizon: {predictor.horizon} trading sessions")
         print(forecasts.to_string(index=False, float_format=lambda value: f"{value:.6f}"))
     except (OSError, ValueError) as exc:
         parser.error(str(exc))

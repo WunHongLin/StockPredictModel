@@ -27,6 +27,7 @@ class StockPredictor:
         config = checkpoint["model_config"]
         self.lookback = config["time_steps"]
         self.horizon = config.get("horizon", 1)
+        self.target_offset = checkpoint.get("target_offset", 1)
         self.first_test_date = checkpoint.get("first_test_date")
 
         with np.load(dataset_path, allow_pickle=False) as dataset:
@@ -80,8 +81,8 @@ class StockPredictor:
 
     def predict(self, as_of_index):
         """Return next-session forecasts for a one-day checkpoint."""
-        if self.horizon != 1:
-            raise ValueError("This operation requires a one-session checkpoint. Use predict.py for multi-session forecasts.")
+        if self.horizon != 1 or self.target_offset != 1:
+            raise ValueError("This operation requires a next-session checkpoint. Use predict.py for other target dates.")
         base_close, ratios = self.predict_path(as_of_index)
         close_ratio = ratios[:, 0]
 
@@ -99,19 +100,20 @@ class StockPredictor:
 
 def forecast_table(predictor, as_of_index):
     dates = predictor.dates
-    if predictor.horizon == 1:
+    if predictor.horizon == 1 and predictor.target_offset == 1:
         forecasts = predictor.predict(as_of_index)
         target = as_of_index + 1
         forecasts.insert(0, "target_date", str(dates[target]) if target < len(dates) else "")
     else:
         base, ratios = predictor.predict_path(as_of_index)
         stocks, horizons = np.where(np.isfinite(ratios))
-        known = dates[as_of_index + 1:as_of_index + 1 + predictor.horizon]
+        first_target = as_of_index + predictor.target_offset
+        known = dates[first_target:first_target + predictor.horizon]
         target_dates = np.full(predictor.horizon, "", dtype="U10")
         target_dates[:len(known)] = known.astype(str)
         forecasts = pd.DataFrame({
             "target_date": target_dates[horizons],
-            "horizon": horizons + 1,
+            "horizon": horizons + predictor.target_offset,
             "symbol": np.asarray(predictor.symbols)[stocks],
             "last_adjusted_close": base[stocks],
             "predicted_adjusted_close": base[stocks] * ratios[stocks, horizons],
@@ -144,11 +146,11 @@ def main():
 
         if args.output:
             forecasts.to_csv(args.output, index=False, mode="x")
-        if predictor.horizon == 1:
+        if predictor.horizon == 1 and predictor.target_offset == 1:
             target = forecasts["target_date"].iat[0] or "next trading session"
             print(f"Signal date: {as_of}; target: {target}")
         else:
-            print(f"Signal date: {as_of}; horizon: {predictor.horizon} trading sessions")
+            print(f"Signal date: {as_of}; first target: t+{predictor.target_offset}; outputs: {predictor.horizon}")
         print(forecasts.to_string(index=False, float_format=lambda value: f"{value:.6f}"))
     except (OSError, ValueError) as exc:
         parser.error(str(exc))

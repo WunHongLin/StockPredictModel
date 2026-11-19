@@ -15,7 +15,6 @@ np.random.seed(123456789)
 torch.random.manual_seed(12345678)
 device = torch.device("cuda") if torch.cuda.is_available() else 'cpu'
 
-lookback_length = 16
 market_num = 20
 learning_rate = 0.001
 alpha = 0.1
@@ -24,7 +23,9 @@ scale_factor = 3
 parser = argparse.ArgumentParser(description="Train StockMixer on TWSE OHLCV data.")
 parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
 parser.add_argument("--epochs", type=int, default=100)
-parser.add_argument("--horizon", type=int, choices=[1, 20], default=1,
+parser.add_argument("--lookback", type=int, default=32,
+                    help="Number of past trading sessions used as input.")
+parser.add_argument("--horizon", "--horizen", type=int, default=1,
                     help="Number of future trading sessions predicted in one pass.")
 parser.add_argument(
     "--patience", type=int, default=10,
@@ -37,6 +38,10 @@ parser.add_argument(
 args = parser.parse_args()
 if args.epochs < 1:
     parser.error("--epochs must be positive")
+if args.lookback < 2:
+    parser.error("--lookback must be at least 2")
+if args.horizon < 1:
+    parser.error("--horizon must be positive")
 if args.patience < 0:
     parser.error("--patience must be non-negative")
 if args.checkpoint is not None and args.checkpoint.resolve() == args.dataset.resolve():
@@ -51,15 +56,21 @@ with np.load(args.dataset, allow_pickle=False) as dataset:
     if dataset["features"].tolist() != FEATURES:
         parser.error("Unexpected feature order. Regenerate the dataset.")
 stock_num, trade_dates, fea_num = ohlcv.shape
+lookback_length = args.lookback
 steps = args.horizon
 valid_index = int(trade_dates * 0.7)
 test_index = int(trade_dates * 0.85)
 train_windows = valid_index - lookback_length - steps + 1
 if train_windows < 1 or min(test_index - valid_index, trade_dates - test_index) < steps:
-    parser.error("Insufficient history for complete forecast windows in each split.")
+    parser.error(
+        f"Insufficient history for lookback={lookback_length} and horizon={steps}. "
+        f"Need at least {lookback_length + steps} training sessions and "
+        f"{steps} sessions each in validation and testing."
+    )
 mask_data = np.isfinite(ohlcv).all(axis=2)
 print(f"{stock_num} stocks, {dates[0]} to {dates[-1]}, "
       f"validation starts {dates[valid_index]}, test starts {dates[test_index]}")
+print(f"Lookback: {lookback_length} trading sessions | Horizon: {steps} trading sessions")
 
 model_config = {
     "stocks": stock_num, "time_steps": lookback_length, "channels": fea_num,
@@ -120,7 +131,8 @@ def validate(offsets):
     else:
         errors = (predicted - actual) * np.stack(base_closes)[:, :, None]
         metrics = {}
-        for day in (1, 5, 10, 20):
+        report_days = sorted({day for day in (1, 5, 10, 20) if day <= steps} | {steps})
+        for day in report_days:
             index = day - 1
             paired = errors[:, :, index][valid[:, :, index]]
             metrics[day] = (

@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+from tempfile import NamedTemporaryFile, mkdtemp
 
 import numpy as np
 import torch
@@ -23,15 +24,28 @@ scale_factor = 3
 parser = argparse.ArgumentParser(description="Train StockMixer on TWSE OHLCV data.")
 parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
 parser.add_argument("--epochs", type=int, default=100)
+parser.add_argument(
+    "--patience", type=int, default=10,
+    help="Stop after this many epochs without lower validation loss. Use 0 to disable.",
+)
+parser.add_argument(
+    "--checkpoint", type=Path,
+    help="File for best model weights. Defaults to checkpoints/run-*/best_stockmixer.pt.",
+)
 args = parser.parse_args()
 if args.epochs < 1:
     parser.error("--epochs must be positive")
+if args.patience < 0:
+    parser.error("--patience must be non-negative")
+if args.checkpoint is not None and args.checkpoint.resolve() == args.dataset.resolve():
+    parser.error("--checkpoint and --dataset must be different files")
 if not args.dataset.is_file():
     parser.error("Dataset missing. Run python src/download_tw50.py first.")
 
 with np.load(args.dataset, allow_pickle=False) as dataset:
     ohlcv = dataset["ohlcv"]
     dates = dataset["dates"]
+    symbols = dataset["symbols"].tolist() if "symbols" in dataset else None
     if dataset["features"].tolist() != FEATURES:
         parser.error("Unexpected feature order. Regenerate the dataset.")
 stock_num, trade_dates, fea_num = ohlcv.shape
@@ -44,18 +58,14 @@ mask_data = np.isfinite(ohlcv).all(axis=2)
 print(f"{stock_num} stocks, {dates[0]} to {dates[-1]}, "
       f"validation starts {dates[valid_index]}, test starts {dates[test_index]}")
 
-model = StockMixer(
-    stocks=stock_num,
-    time_steps=lookback_length,
-    channels=fea_num,
-    market=market_num,
-    scale=scale_factor
-).to(device)
-
+model_config = {
+    "stocks": stock_num, "time_steps": lookback_length, "channels": fea_num,
+    "market": market_num, "scale": scale_factor,
+}
+model = StockMixer(**model_config).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-best_valid_loss = np.inf
-best_valid_perf = None
-best_test_perf = None
+
+
 def has_valid_stock(offset):
     return mask_data[:, offset:offset + lookback_length + steps].all(axis=1).any()
 
@@ -115,6 +125,36 @@ def get_batch(offset):
     return window, valid[:, None], np.ones_like(returns[:, None]), returns[:, None]
 
 
+def save_checkpoint(path, checkpoint):
+    # Write a complete checkpoint before replacing the previous best.
+    with NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as temporary:
+        temporary_path = Path(temporary.name)
+    try:
+        torch.save(checkpoint, temporary_path)
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def print_performance(split, metrics):
+    print(
+        f"{split} performance: mse:{metrics['mse']:.2e}, IC:{metrics['IC']:.2e}, "
+        f"RIC:{metrics['RIC']:.2e}, prec@10:{metrics['prec_10']:.2e}, "
+        f"SR:{metrics['sharpe5']:.2e}"
+    )
+
+
+checkpoint_path = args.checkpoint
+if checkpoint_path is None:
+    checkpoint_dir = Path("checkpoints")
+    checkpoint_dir.mkdir(exist_ok=True)
+    checkpoint_path = Path(mkdtemp(prefix="run-", dir=checkpoint_dir)) / "best_stockmixer.pt"
+else:
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+best_valid_loss = np.inf
+epochs_without_improvement = 0
+
 for epoch in range(args.epochs):
     model.train()
     print("epoch{}##########################################################".format(epoch + 1))
@@ -145,15 +185,34 @@ for epoch in range(args.epochs):
     val_loss, val_reg_loss, val_rank_loss, val_perf = validate(valid_index, test_index)
     print('Valid : loss:{:.2e}  =  {:.2e} + alpha*{:.2e}'.format(val_loss, val_reg_loss, val_rank_loss))
 
-    test_loss, test_reg_loss, test_rank_loss, test_perf = validate(test_index, trade_dates)
-    print('Test: loss:{:.2e}  =  {:.2e} + alpha*{:.2e}'.format(test_loss, test_reg_loss, test_rank_loss))
+    print_performance("Valid", val_perf)
+    if not np.isfinite(val_loss):
+        raise RuntimeError(f"Non-finite validation loss at epoch {epoch + 1}.")
 
     if val_loss < best_valid_loss:
+        save_checkpoint(checkpoint_path, {
+            "model_state_dict": model.state_dict(),
+            "model_config": model_config,
+            "epoch": epoch + 1,
+            "val_loss": float(val_loss),
+            "symbols": symbols,
+            "features": FEATURES,
+        })
         best_valid_loss = val_loss
-        best_valid_perf = val_perf
-        best_test_perf = test_perf
+        epochs_without_improvement = 0
+        print(f"Saved best checkpoint to {checkpoint_path}")
+    else:
+        epochs_without_improvement += 1
+        if args.patience and epochs_without_improvement >= args.patience:
+            print(f"Early stopping at epoch {epoch + 1} (patience={args.patience}).")
+            break
 
-    print('Valid performance:\n', 'mse:{:.2e}, IC:{:.2e}, RIC:{:.2e}, prec@10:{:.2e}, SR:{:.2e}'.format(val_perf['mse'], val_perf['IC'],
-                                                     val_perf['RIC'], val_perf['prec_10'], val_perf['sharpe5']))
-    print('Test performance:\n', 'mse:{:.2e}, IC:{:.2e}, RIC:{:.2e}, prec@10:{:.2e}, SR:{:.2e}'.format(test_perf['mse'], test_perf['IC'],
-                                                                            test_perf['RIC'], test_perf['prec_10'], test_perf['sharpe5']), '\n\n')
+checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+model.load_state_dict(checkpoint["model_state_dict"])
+print(
+    f"Best epoch: {checkpoint['epoch']}; "
+    f"validation loss: {checkpoint['val_loss']:.6e}; epochs run: {epoch + 1}"
+)
+test_loss, test_reg_loss, test_rank_loss, test_perf = validate(test_index, trade_dates)
+print(f"Test: loss:{test_loss:.2e} = {test_reg_loss:.2e} + alpha*{test_rank_loss:.2e}")
+print_performance("Test", test_perf)

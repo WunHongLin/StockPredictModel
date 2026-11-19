@@ -8,9 +8,13 @@ def get_loss(prediction, ground_truth, base_price, mask, batch_size, alpha):
     return_ratio = (prediction - base_price) / base_price
     reg_loss = ((return_ratio - ground_truth).square() * mask).sum() / mask.sum().clamp_min(1)
 
-    prediction_diff = return_ratio - return_ratio.T
-    target_diff = ground_truth.T - ground_truth
-    pair_mask = mask @ mask.T
+    # Compare stocks within each horizon, never across prediction dates.
+    predicted = return_ratio.T
+    target = ground_truth.T
+    valid = mask.T
+    prediction_diff = predicted[:, :, None] - predicted[:, None, :]
+    target_diff = target[:, None, :] - target[:, :, None]
+    pair_mask = valid[:, :, None] * valid[:, None, :]
     rank_loss = (F.relu(prediction_diff * target_diff) * pair_mask).sum() / pair_mask.sum().clamp_min(1)
     loss = reg_loss + alpha * rank_loss
     return loss, reg_loss, rank_loss, return_ratio
@@ -166,15 +170,15 @@ class NoGraphMixer(nn.Module):
 
 
 class StockMixer(nn.Module):
-    def __init__(self, stocks, time_steps, channels, market, scale):
+    def __init__(self, stocks, time_steps, channels, market, scale, horizon=1):
         super(StockMixer, self).__init__()
         scale_dim = 8
         self.mixer = MultTime2dMixer(time_steps, channels, scale_dim=scale_dim)
         self.channel_fc = nn.Linear(channels, 1)
-        self.time_fc = nn.Linear(time_steps * 2 + scale_dim, 1)
+        self.time_fc = nn.Linear(time_steps * 2 + scale_dim, horizon)
         self.conv = nn.Conv1d(in_channels=channels, out_channels=channels, kernel_size=2, stride=2)
         self.stock_mixer = NoGraphMixer(stocks, market)
-        self.time_fc_ = nn.Linear(time_steps * 2 + scale_dim, 1)
+        self.time_fc_ = nn.Linear(time_steps * 2 + scale_dim, horizon)
 
     def forward(self, inputs):
         x = inputs.permute(0, 2, 1)

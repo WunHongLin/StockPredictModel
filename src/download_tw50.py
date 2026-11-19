@@ -1,6 +1,7 @@
 """Build an aligned dataset of TWSE-listed companies ranked by market cap."""
 import argparse
 import json
+import ssl
 from datetime import date, datetime
 from pathlib import Path
 from time import sleep
@@ -17,7 +18,10 @@ TWSE = "https://openapi.twse.com.tw/v1/"
 
 
 def fetch_twse(endpoint):
-    with urlopen(TWSE + endpoint, timeout=30) as response:
+    context = ssl.create_default_context()
+    context.verify_flags &= ~ssl.VERIFY_X509_STRICT
+
+    with urlopen(TWSE + endpoint, timeout=30, context=context) as response:
         return pd.DataFrame(json.load(response))
 
 

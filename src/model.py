@@ -172,7 +172,10 @@ class NoGraphMixer(nn.Module):
 class StockMixer(nn.Module):
     def __init__(self, stocks, time_steps, channels, market, scale, horizon=1):
         super(StockMixer, self).__init__()
-        scale_dim = 8
+        if time_steps < 2:
+            raise ValueError("StockMixer needs at least two input time steps.")
+        # The two-day convolution has stride two and no padding.
+        scale_dim = time_steps // 2
         self.mixer = MultTime2dMixer(time_steps, channels, scale_dim=scale_dim)
         self.channel_fc = nn.Linear(channels, 1)
         self.time_fc = nn.Linear(time_steps * 2 + scale_dim, horizon)

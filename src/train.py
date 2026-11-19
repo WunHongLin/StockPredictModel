@@ -28,6 +28,8 @@ parser.add_argument("--lookback", type=int, default=32,
                     help="Number of past trading sessions used as input.")
 parser.add_argument("--horizon", "--horizen", type=int, default=1,
                     help="Number of future trading sessions predicted in one pass.")
+parser.add_argument("--target-offset", type=int, default=1,
+                    help="Trading sessions from the input's last close to the first target.")
 parser.add_argument(
     "--patience", type=int, default=10,
     help="Stop after this many epochs without lower validation loss. Use 0 to disable.",
@@ -43,6 +45,10 @@ if args.lookback < 2:
     parser.error("--lookback must be at least 2")
 if args.horizon < 1:
     parser.error("--horizon must be positive")
+if args.target_offset < 1:
+    parser.error("--target-offset must be positive")
+if args.target_offset != 1 and args.horizon != 1:
+    parser.error("--target-offset greater than 1 requires --horizon 1")
 if args.patience < 0:
     parser.error("--patience must be non-negative")
 if args.checkpoint is not None and args.checkpoint.resolve() == args.dataset.resolve():
@@ -59,19 +65,22 @@ with np.load(args.dataset, allow_pickle=False) as dataset:
 stock_num, trade_dates, fea_num = ohlcv.shape
 lookback_length = args.lookback
 steps = args.horizon
+target_offset = args.target_offset
+target_start_offset = lookback_length + target_offset - 1
 valid_index = int(trade_dates * 0.7)
 test_index = int(trade_dates * 0.85)
-train_windows = valid_index - lookback_length - steps + 1
-if train_windows < 1 or min(test_index - valid_index, trade_dates - test_index) < steps:
+train_windows = valid_index - target_start_offset - steps + 1
+required_target_span = target_offset + steps - 1
+if train_windows < 1 or min(test_index - valid_index, trade_dates - test_index) < required_target_span:
     parser.error(
-        f"Insufficient history for lookback={lookback_length} and horizon={steps}. "
-        f"Need at least {lookback_length + steps} training sessions and "
-        f"{steps} sessions each in validation and testing."
+        f"Insufficient history for lookback={lookback_length}, horizon={steps}, target-offset={target_offset}. "
+        f"Need at least {target_start_offset + steps} training sessions and "
+        f"{required_target_span} sessions each in validation and testing."
     )
 mask_data = np.isfinite(ohlcv).all(axis=2)
 print(f"{stock_num} stocks, {dates[0]} to {dates[-1]}, "
       f"validation starts {dates[valid_index]}, test starts {dates[test_index]}")
-print(f"Lookback: {lookback_length} trading sessions | Horizon: {steps} trading sessions")
+print(f"Lookback: {lookback_length} | Outputs: {steps} | First target: t+{target_offset} trading sessions")
 
 model_config = {
     "stocks": stock_num, "time_steps": lookback_length, "channels": fea_num,
@@ -83,13 +92,15 @@ optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
 def target_mask(offset):
     end = offset + lookback_length
-    return mask_data[:, offset:end].all(axis=1, keepdims=True) & mask_data[:, end:end + steps]
+    target_start = offset + target_start_offset
+    return mask_data[:, offset:end].all(axis=1, keepdims=True) & mask_data[:, target_start:target_start + steps]
 
 
 def offsets_for_split(start, end):
-    # Both the first and the last target must belong to this split.
+    # Start no earlier than the prior split's last close as the signal date.
+    # Keep all targets within this split so the forecast never uses future labels.
     return [
-        offset for offset in range(max(0, start - lookback_length), end - lookback_length - steps + 1)
+        offset for offset in range(max(0, start - lookback_length), end - target_start_offset - steps + 1)
         if target_mask(offset).any()
     ]
 
@@ -105,7 +116,9 @@ def get_batch(offset):
     end = offset + lookback_length
     window, base = prepare_window(ohlcv[:, offset:end], mask_data[:, offset:end])
     valid = target_mask(offset)
-    returns = np.where(valid, ohlcv[:, end:end + steps, 3] / base[:, None] - 1, 0.0)
+    target_start = offset + target_start_offset
+    target_closes = ohlcv[:, target_start:target_start + steps, 3]
+    returns = np.where(valid, target_closes / base[:, None] - 1, 0.0)
     return window, valid, np.ones_like(base[:, None]), returns, base
 
 
@@ -127,14 +140,17 @@ def validate(offsets):
             masks.append(valid)
             base_closes.append(base)
     predicted, actual, valid = (np.stack(rows) for rows in (predictions, targets, masks))
-    if steps == 1:
+    if steps == 1 and target_offset == 1:
         metrics = evaluate(predicted[:, :, 0].T, actual[:, :, 0].T, valid[:, :, 0].T)
     else:
         errors = (predicted - actual) * np.stack(base_closes)[:, :, None]
         metrics = {}
-        report_days = sorted({day for day in (1, 5, 10, 20) if day <= steps} | {steps})
+        last_day = target_offset + steps - 1
+        report_days = sorted({
+            day for day in (1, 5, 10, 20) if target_offset <= day <= last_day
+        } | {last_day})
         for day in report_days:
-            index = day - 1
+            index = day - target_offset
             paired = errors[:, :, index][valid[:, :, index]]
             metrics[day] = (
                 float(np.abs(paired).mean()) if paired.size else np.nan,
@@ -156,7 +172,7 @@ def save_checkpoint(path, checkpoint):
 
 
 def print_performance(split, metrics):
-    if steps > 1:
+    if steps > 1 or target_offset > 1:
         for day, (mae, rmse, samples) in metrics.items():
             print(f"{split} day +{day}: MAE={mae:.4f} TWD, RMSE={rmse:.4f} TWD, pairs={samples}")
         return
@@ -220,7 +236,8 @@ for epoch in range(args.epochs):
             "val_loss": float(val_loss),
             "symbols": symbols,
             "features": FEATURES,
-            "first_test_date": str(dates[test_index]),
+            "first_test_date": str(dates[test_index + target_offset - 1]),
+            "target_offset": target_offset,
         })
         best_valid_loss = val_loss
         epochs_without_improvement = 0
